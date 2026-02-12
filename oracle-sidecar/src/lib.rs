@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -21,9 +23,20 @@ pub struct TaskRecord {
     pub status: TaskStatus,
 }
 
-#[derive(Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct TaskStore {
+    tasks: Vec<TaskRecord>,
+}
+
 pub struct Sidecar {
     tasks: HashMap<Uuid, TaskRecord>,
+    run_dir: PathBuf,
+}
+
+impl Default for Sidecar {
+    fn default() -> Self {
+        Self::new(".oracle/runs")
+    }
 }
 
 #[derive(Debug, Error)]
@@ -36,6 +49,8 @@ pub enum RpcError {
     MethodNotFound,
     #[error("parse error: {0}")]
     Parse(String),
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 impl RpcError {
@@ -45,6 +60,7 @@ impl RpcError {
             RpcError::MethodNotFound => -32601,
             RpcError::InvalidParams(_) => -32602,
             RpcError::TaskNotFound => -32004,
+            RpcError::Internal(_) => -32603,
         }
     }
 }
@@ -59,6 +75,16 @@ struct RpcRequest {
 }
 
 impl Sidecar {
+    pub fn new(run_dir: impl AsRef<Path>) -> Self {
+        let run_dir = run_dir.as_ref().to_path_buf();
+        let mut sidecar = Self {
+            tasks: HashMap::new(),
+            run_dir,
+        };
+        let _ = sidecar.load_store();
+        sidecar
+    }
+
     pub fn handle_json_line(&mut self, line: &str) -> Value {
         let req: Result<RpcRequest, _> = serde_json::from_str(line);
         match req {
@@ -75,6 +101,8 @@ impl Sidecar {
                     "task.start" => self.task_start(&request.params).map(|rec| json!(rec)),
                     "task.status" => self.task_status(&request.params).map(|rec| json!(rec)),
                     "task.cancel" => self.task_cancel(&request.params).map(|rec| json!(rec)),
+                    "task.complete" => self.task_complete(&request.params).map(|rec| json!(rec)),
+                    "task.list" => Ok(json!(self.task_list())),
                     _ => Err(RpcError::MethodNotFound),
                 };
 
@@ -106,6 +134,7 @@ impl Sidecar {
         };
 
         self.tasks.insert(record.task_id, record.clone());
+        self.persist_store()?;
         Ok(record)
     }
 
@@ -125,12 +154,24 @@ impl Sidecar {
     }
 
     fn task_cancel(&mut self, params: &Value) -> Result<TaskRecord, RpcError> {
+        self.update_task_status(params, TaskStatus::Cancelled)
+    }
+
+    fn task_complete(&mut self, params: &Value) -> Result<TaskRecord, RpcError> {
+        self.update_task_status(params, TaskStatus::Completed)
+    }
+
+    fn update_task_status(
+        &mut self,
+        params: &Value,
+        new_status: TaskStatus,
+    ) -> Result<TaskRecord, RpcError> {
         #[derive(Deserialize)]
-        struct CancelParams {
+        struct TaskIdParams {
             task_id: Uuid,
         }
 
-        let parsed: CancelParams = serde_json::from_value(params.clone())
+        let parsed: TaskIdParams = serde_json::from_value(params.clone())
             .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
 
         let task = self
@@ -138,8 +179,62 @@ impl Sidecar {
             .get_mut(&parsed.task_id)
             .ok_or(RpcError::TaskNotFound)?;
 
-        task.status = TaskStatus::Cancelled;
-        Ok(task.clone())
+        task.status = new_status;
+        let updated = task.clone();
+        self.persist_store()?;
+        Ok(updated)
+    }
+
+    fn task_list(&self) -> Vec<TaskRecord> {
+        let mut tasks: Vec<_> = self.tasks.values().cloned().collect();
+        tasks.sort_by_key(|task| task.task_id);
+        tasks
+    }
+
+    fn store_path(&self) -> PathBuf {
+        self.run_dir.join("tasks.json")
+    }
+
+    fn load_store(&mut self) -> Result<(), RpcError> {
+        let path = self.store_path();
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let content = fs::read_to_string(&path)
+            .map_err(|e| RpcError::Internal(format!("failed to read {}: {}", path.display(), e)))?;
+        let store: TaskStore = serde_json::from_str(&content).map_err(|e| {
+            RpcError::Internal(format!("failed to parse {}: {}", path.display(), e))
+        })?;
+
+        self.tasks = store
+            .tasks
+            .into_iter()
+            .map(|task| (task.task_id, task))
+            .collect();
+
+        Ok(())
+    }
+
+    fn persist_store(&self) -> Result<(), RpcError> {
+        fs::create_dir_all(&self.run_dir).map_err(|e| {
+            RpcError::Internal(format!(
+                "failed to create run dir {}: {}",
+                self.run_dir.display(),
+                e
+            ))
+        })?;
+
+        let store = TaskStore {
+            tasks: self.task_list(),
+        };
+
+        let content = serde_json::to_string_pretty(&store)
+            .map_err(|e| RpcError::Internal(format!("failed to serialize task store: {}", e)))?;
+
+        let path = self.store_path();
+        fs::write(&path, content)
+            .map_err(|e| RpcError::Internal(format!("failed to write {}: {}", path.display(), e)))
     }
 
     pub fn run_stdio<R: BufRead, W: Write>(
@@ -188,9 +283,13 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    fn unique_test_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("oracle-sidecar-test-{}", Uuid::new_v4()))
+    }
+
     #[test]
     fn starts_and_reads_status() {
-        let mut sidecar = Sidecar::default();
+        let mut sidecar = Sidecar::new(unique_test_dir());
         let response = sidecar.handle_json_line(
             r#"{"jsonrpc":"2.0","id":1,"method":"task.start","params":{"prompt":"build dashboard","mode":"ARCHITECT"}}"#,
         );
@@ -205,8 +304,8 @@ mod tests {
     }
 
     #[test]
-    fn cancels_task() {
-        let mut sidecar = Sidecar::default();
+    fn cancels_and_completes_task() {
+        let mut sidecar = Sidecar::new(unique_test_dir());
         let start = sidecar.handle_json_line(
             r#"{"jsonrpc":"2.0","id":1,"method":"task.start","params":{"prompt":"fix ui"}}"#,
         );
@@ -218,11 +317,54 @@ mod tests {
         ));
 
         assert_eq!(cancel["result"]["status"], "cancelled");
+
+        let complete = sidecar.handle_json_line(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"task.complete\",\"params\":{{\"task_id\":\"{}\"}}}}",
+            task_id
+        ));
+
+        assert_eq!(complete["result"]["status"], "completed");
+    }
+
+    #[test]
+    fn lists_tasks() {
+        let mut sidecar = Sidecar::new(unique_test_dir());
+        sidecar.handle_json_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"task.start","params":{"prompt":"first"}}"#,
+        );
+        sidecar.handle_json_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"task.start","params":{"prompt":"second"}}"#,
+        );
+
+        let list = sidecar
+            .handle_json_line(r#"{"jsonrpc":"2.0","id":3,"method":"task.list","params":{}}"#);
+
+        assert_eq!(list["result"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn persists_store_across_instances() {
+        let run_dir = unique_test_dir();
+        let mut first = Sidecar::new(&run_dir);
+        let start = first.handle_json_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"task.start","params":{"prompt":"persist me"}}"#,
+        );
+
+        let task_id = start["result"]["task_id"].as_str().unwrap().to_string();
+
+        let second = Sidecar::new(&run_dir);
+        let loaded = second
+            .tasks
+            .get(&Uuid::parse_str(&task_id).unwrap())
+            .unwrap();
+
+        assert_eq!(loaded.prompt, "persist me");
+        assert_eq!(loaded.status, TaskStatus::Running);
     }
 
     #[test]
     fn returns_method_not_found() {
-        let mut sidecar = Sidecar::default();
+        let mut sidecar = Sidecar::new(unique_test_dir());
         let response = sidecar
             .handle_json_line(r#"{"jsonrpc":"2.0","id":1,"method":"unknown.method","params":{}}"#);
 
